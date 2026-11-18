@@ -1948,21 +1948,28 @@ case $mode in
     ) &
     stop_watcher=$!
     if [ "${DD_VENUS:-0}" = 1 ] && [ -x /usr/local/bin/droiddeck-glprobe ] && [ "${GALLIUM_DRIVER:-}" = zink ]; then
-      LIBGL_DEBUG=verbose MESA_LOG_LEVEL=debug timeout 20 /usr/local/bin/droiddeck-glprobe 2>&1 | grep -v drirc | head -60 | sed 's/^/== glprobe: /'
-      if [ "${PIPESTATUS[0]}" = 1 ]; then
-        VK_LOADER_DEBUG=error,warn timeout 20 /usr/local/bin/droiddeck-glprobe 2>&1 | grep -v drirc | head -40 | sed 's/^/== glprobe (loader): /'
-        DROIDDECK_MALI_COMPAT_TRACE=1 MESA_DEBUG=1 MESA_LOG_LEVEL=debug LIBGL_DEBUG=verbose ZINK_DEBUG=mem VN_DEBUG=init,result,log_ctx_info \
-          timeout 30 /usr/local/bin/droiddeck-glprobe > "${DD_DEBUG_DIR:-/tmp}/glprobe-trace.txt" 2>&1
-        grep -v drirc "${DD_DEBUG_DIR:-/tmp}/glprobe-trace.txt" | head -120 | sed 's/^/== glprobe (trace): /'
-        echo "== glprobe (trace): last pre-device query before Zink gave up: $(grep 'droiddeck-mali-compat: trace:' "${DD_DEBUG_DIR:-/tmp}/glprobe-trace.txt" | grep -v 'trace:   extensions:' | tail -1)"
-        command -v vulkaninfo >/dev/null 2>&1 && DROIDDECK_MALI_COMPAT_TRACE=1 timeout 20 vulkaninfo --summary 2>&1 | head -40 | sed 's/^/== glprobe (vulkaninfo): /'
+      LIBGL_DEBUG=verbose MESA_LOG_LEVEL=debug timeout -k 5 20 /usr/local/bin/droiddeck-glprobe 2>&1 | grep -v drirc | sed -n '1,60p' | sed 's/^/== glprobe: /'
+      dd_gl_status=${PIPESTATUS[0]}
+      if [ "$dd_gl_status" != 0 ]; then
+        echo "== glprobe: failed with status $dd_gl_status"
         dd_gl_ok=
-        for dd_variant in "ZINK_DEBUG=" "ZINK_DEBUG= ZINK_DESCRIPTORS=auto" "ZINK_DEBUG= LIBGL_KOPPER_DISABLE=true" "ZINK_DEBUG= DROIDDECK_MALI_COMPAT=0"; do
-          if env $dd_variant timeout 20 /usr/local/bin/droiddeck-glprobe 2>&1 | grep -v drirc | head -20 | sed "s/^/== glprobe ($dd_variant): /"; [ "${PIPESTATUS[0]}" = 0 ]; then
-            dd_gl_ok=$dd_variant
-            break
-          fi
-        done
+        if [ "$dd_gl_status" = 1 ]; then
+          VK_LOADER_DEBUG=error,warn timeout -k 5 20 /usr/local/bin/droiddeck-glprobe 2>&1 | grep -v drirc | sed -n '1,40p' | sed 's/^/== glprobe (loader): /'
+          DROIDDECK_MALI_COMPAT_TRACE=1 MESA_DEBUG=1 MESA_LOG_LEVEL=debug LIBGL_DEBUG=verbose ZINK_DEBUG=mem VN_DEBUG=init,result,log_ctx_info \
+            timeout -k 5 30 /usr/local/bin/droiddeck-glprobe > "${DD_DEBUG_DIR:-/tmp}/glprobe-trace.txt" 2>&1
+          grep -v drirc "${DD_DEBUG_DIR:-/tmp}/glprobe-trace.txt" | head -120 | sed 's/^/== glprobe (trace): /'
+          echo "== glprobe (trace): last pre-device query before Zink gave up: $(grep 'droiddeck-mali-compat: trace:' "${DD_DEBUG_DIR:-/tmp}/glprobe-trace.txt" | grep -v 'trace:   extensions:' | tail -1)"
+          command -v vulkaninfo >/dev/null 2>&1 && DROIDDECK_MALI_COMPAT_TRACE=1 timeout -k 5 20 vulkaninfo --summary 2>&1 | sed -n '1,40p' | sed 's/^/== glprobe (vulkaninfo): /'
+          for dd_variant in "ZINK_DEBUG=" "ZINK_DEBUG= ZINK_DESCRIPTORS=auto" "ZINK_DEBUG= LIBGL_KOPPER_DISABLE=true" "ZINK_DEBUG= DROIDDECK_MALI_COMPAT=0"; do
+            env $dd_variant timeout -k 5 20 /usr/local/bin/droiddeck-glprobe 2>&1 | grep -v drirc | sed -n '1,20p' | sed "s/^/== glprobe ($dd_variant): /"
+            dd_gl_status=${PIPESTATUS[0]}
+            if [ "$dd_gl_status" = 0 ]; then
+              dd_gl_ok=$dd_variant
+              break
+            fi
+            [ "$dd_gl_status" = 1 ] || break
+          done
+        fi
         if [ -n "$dd_gl_ok" ] && [ "$dd_gl_ok" != "ZINK_DEBUG= DROIDDECK_MALI_COMPAT=0" ]; then
           for dd_kv in $dd_gl_ok; do
             case $dd_kv in *=) unset "${dd_kv%=}" ;; *) export "$dd_kv" ;; esac
@@ -1970,12 +1977,23 @@ case $mode in
           echo "== venus: GL through Zink starts with: $dd_gl_ok (the Steam client gets that)"
         else
           [ -n "$dd_gl_ok" ] && echo "== venus: Zink starts only without the Mali compatibility layer (then without nullDescriptor); not used"
+          for dd_kv in GALLIUM_DRIVER LIBGL_ALWAYS_SOFTWARE MESA_LOADER_DRIVER_OVERRIDE LIBGL_KOPPER_DRI2 VK_DRIVER_FILES VK_ICD_FILENAMES; do
+            export "DROIDDECK_GAME_$dd_kv=${!dd_kv-}"
+          done
           export GALLIUM_DRIVER=llvmpipe LIBGL_ALWAYS_SOFTWARE=1
           unset MESA_LOADER_DRIVER_OVERRIDE LIBGL_KOPPER_DRI2
-          echo "== venus: GL through Zink did not start (see glprobe above); the Steam client's GL uses llvmpipe (software)"
+          # Steam's GPU query and CEF still enumerate Vulkan devices with CEF GPU rendering disabled.
+          if [ -r /usr/share/vulkan/icd.d/lvp_icd.json ]; then
+            export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json
+          else
+            export VK_DRIVER_FILES=/dev/null VK_ICD_FILENAMES=/dev/null
+          fi
+          _dd_cef=(-cef-disable-gpu -cef-disable-gpu-compositing)
+          echo "== venus: GL through Zink did not start (see glprobe above); the Steam client's GL, Vulkan and CEF use software rendering (Vulkan ICD: $VK_DRIVER_FILES); games keep their GPU settings"
         fi
         unset dd_gl_ok dd_variant dd_kv
       fi
+      unset dd_gl_status
     fi
     rm -f "$HOME/.dd-restart-game" "$HOME/.dd-restarted-for"
     while :; do
